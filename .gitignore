@@ -3,15 +3,12 @@
 *.a
 *.so
 hello.bpf.o
-hello_loader
 
 # perf/trace outputs
 events/
-*.json
 
 # editor/OS junk
 *.swp
 .DS_Store
 .vscode/
 .idea/
-hello_getdents_loader

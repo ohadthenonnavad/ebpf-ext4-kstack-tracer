@@ -1,0 +1,33 @@
+{
+  "timestamp": "2025-08-12T14:57:42.271650+03:00",
+  "hostname": "monsterpc",
+  "kernel_version": "6.14.0-27-generic",
+  "ls_pid": 166813,
+  "comm": "ls",
+  "probe": "ext4_bread",
+  "cpu": 0,
+  "frames": [
+    { "index": 0, "addr": "0xffffffffaa6d6251", "symbol": "ext4_bread", "offset": "0x1" },
+    { "index": 1, "addr": "0xffffffffaa6f270a", "symbol": "htree_dirblock_to_tree", "offset": "0x9a" },
+    { "index": 2, "addr": "0xffffffffaa6f3870", "symbol": "ext4_htree_fill_tree", "offset": "0x120" },
+    { "index": 3, "addr": "0xffffffffaa6b2d19", "symbol": "ext4_dx_readdir", "offset": "0x259" },
+    { "index": 4, "addr": "0xffffffffaa6b3739", "symbol": "ext4_readdir", "offset": "0x649" },
+    { "index": 5, "addr": "0xffffffffaa5dee5b", "symbol": "iterate_dir", "offset": "0xbb" },
+    { "index": 6, "addr": "0xffffffffaa5df6b3", "symbol": "__x64_sys_getdents64", "offset": "0x83" },
+    { "index": 7, "addr": "0xffffffffaa0849e7", "symbol": "x64_sys_call", "offset": "0xed7" },
+    { "index": 8, "addr": "0xffffffffab2d479e", "symbol": "do_syscall_64", "offset": "0x7e" },
+    { "index": 9, "addr": "0xffffffffa9e0012b", "symbol": "entry_SYSCALL_64_after_hwframe", "offset": "0x76" }
+  ],
+  "stack_text": [
+    "0xffffffffaa6d6251 ext4_bread+0x1",
+    "0xffffffffaa6f270a htree_dirblock_to_tree+0x9a",
+    "0xffffffffaa6f3870 ext4_htree_fill_tree+0x120",
+    "0xffffffffaa6b2d19 ext4_dx_readdir+0x259",
+    "0xffffffffaa6b3739 ext4_readdir+0x649",
+    "0xffffffffaa5dee5b iterate_dir+0xbb",
+    "0xffffffffaa5df6b3 __x64_sys_getdents64+0x83",
+    "0xffffffffaa0849e7 x64_sys_call+0xed7",
+    "0xffffffffab2d479e do_syscall_64+0x7e",
+    "0xffffffffa9e0012b entry_SYSCALL_64_after_hwframe+0x76"
+  ]
+}
