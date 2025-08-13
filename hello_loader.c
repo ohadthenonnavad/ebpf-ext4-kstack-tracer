@@ -15,19 +15,31 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
+static volatile sig_atomic_t exiting = 0;
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
     return vfprintf(stderr, format, args);
 }
 
-static volatile sig_atomic_t exiting = 0;
-static FILE *g_jsonl = NULL;
-static char g_jsonl_path[512] = {0};
-
 static void sig_handler(int sig)
 {
+    (void)sig;
     exiting = 1;
 }
+
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [--getdents-only]\n\n"
+            "  --getdents-only   Load getdents-only BPF (ext4_dx_readdir, ext4_bread). Default loads full tracer.\n",
+            prog);
+}
+
+static FILE *g_jsonl = NULL;
+static char g_jsonl_path[512] = {0};
+static time_t g_jsonl_opened_at = 0; /* epoch seconds when current JSONL was opened */
+static char g_out_dir[64] = "events"; /* default output directory */
 
 /* Struct must match BPF side */
 #define MAX_STACK_DEPTH 127
@@ -166,9 +178,39 @@ static void read_comm_from_proc(int pid, char *buf, size_t bufsz)
 }
 
 /* Write a single event as one-line JSON (JSONL) */
-static void write_event_jsonl_line(FILE *out, int cpu, struct stack_trace_t *trace)
+static void open_new_jsonl(void)
 {
-    if (!out) return;
+    char iso_ts[64];
+    current_time_iso8601(iso_ts, sizeof(iso_ts));
+    for (char *p = iso_ts; *p; ++p) { if (*p == ':' || *p == ' ') *p = '-'; }
+    char hostname[256] = {0};
+    if (gethostname(hostname, sizeof(hostname)) != 0)
+        strncpy(hostname, "unknown", sizeof(hostname)-1);
+    snprintf(g_jsonl_path, sizeof(g_jsonl_path), "%s/capture_%s_%s.jsonl", g_out_dir, iso_ts, hostname);
+    g_jsonl = fopen(g_jsonl_path, "w");
+    if (!g_jsonl) {
+        fprintf(stderr, "[warn] cannot open %s for writing: %s\n", g_jsonl_path, strerror(errno));
+    } else {
+        g_jsonl_opened_at = time(NULL);
+        printf("Writing JSONL events to %s\n", g_jsonl_path);
+    }
+}
+
+static void maybe_rotate_jsonl(void)
+{
+    time_t now = time(NULL);
+    /* rotate every 5 minutes */
+    if (g_jsonl && g_jsonl_opened_at + 300 <= now) {
+        fclose(g_jsonl);
+        g_jsonl = NULL;
+        open_new_jsonl();
+    }
+}
+
+static void write_event_jsonl_line(int cpu, struct stack_trace_t *trace)
+{
+    maybe_rotate_jsonl();
+    if (!g_jsonl) return;
     char iso_ts[64];
     current_time_iso8601(iso_ts, sizeof(iso_ts));
 
@@ -199,26 +241,27 @@ static void write_event_jsonl_line(FILE *out, int cpu, struct stack_trace_t *tra
     int frames = trace->kern_stack_size / (int)sizeof(__u64);
 
     /* Start JSON object */
-    fprintf(out, "{\"timestamp\":\"%s\",\"hostname\":\"%s\",\"kernel_version\":\"%s\",",
+    fprintf(g_jsonl, "{\"timestamp\":\"%s\",\"hostname\":\"%s\",\"kernel_version\":\"%s\",",
             iso_ts, hostname, uts.release);
-    fprintf(out, "\"ls_pid\":%d,\"comm\":\"%s\",\"probe\":\"%s\",\"cpu\":%d,\"frames\":[",
+    fprintf(g_jsonl, "\"ls_pid\":%d,\"comm\":\"%s\",\"probe\":\"%s\",\"cpu\":%d,\"frames\":[",
             trace->pid, comm, probe, cpu);
 
     for (int i = 0; i < frames; i++) {
         unsigned long long addr = (unsigned long long)trace->kern_stack[i];
         unsigned long long off = 0;
         const char *name = resolve_kaddr(addr, &off);
-        if (i) fputc(',', out);
+        if (i) fputc(',', g_jsonl);
         if (name)
-            fprintf(out, "{\"index\":%d,\"addr\":\"0x%llx\",\"symbol\":\"%s\",\"offset\":\"0x%llx\"}",
+            fprintf(g_jsonl, "{\"index\":%d,\"addr\":\"0x%llx\",\"symbol\":\"%s\",\"offset\":\"0x%llx\"}",
                     i, addr, name, off);
         else
-            fprintf(out, "{\"index\":%d,\"addr\":\"0x%llx\",\"symbol\":null,\"offset\":\"0x0\"}",
-                    i, addr);
+            fprintf(g_jsonl, "{\"index\":%d,\"addr\":\"0x%llx\",\"symbol\":null,\"offset\":\"0x%llx\"}",
+                    i, addr, off);
     }
-    fputs("]}\n", out);
-    fflush(out);
+    fprintf(g_jsonl, "]}\n");
+    fflush(g_jsonl);
 }
+
 static void write_event_json(int cpu, struct stack_trace_t *trace)
 {
     char iso_ts[64];
@@ -314,7 +357,7 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
     fflush(stdout);
 
     /* Append JSONL line to the capture file */
-    write_event_jsonl_line(g_jsonl, cpu, trace);
+    write_event_jsonl_line(cpu, trace);
 }
 
 static void handle_lost(void *ctx, int cpu, __u64 lost_cnt)
@@ -329,6 +372,23 @@ int main(int argc, char **argv)
     struct bpf_program *prog;
     struct bpf_object *obj;
     int err;
+    const char *obj_path = "hello.bpf.o"; /* default: full tracer */
+    bool getdents_only = false;
+
+    /* Parse minimal flags */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--getdents-only") == 0) {
+            obj_path = "getdents_only.bpf.o";
+            getdents_only = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
 
     libbpf_set_print(libbpf_print_fn);
 
@@ -344,9 +404,9 @@ int main(int argc, char **argv)
     }
 
     /* Open BPF application */
-    obj = bpf_object__open_file("hello.bpf.o", NULL);
+    obj = bpf_object__open_file(obj_path, NULL);
     if (libbpf_get_error(obj)) {
-        fprintf(stderr, "ERROR: opening BPF object file failed\n");
+        fprintf(stderr, "ERROR: opening BPF object file '%s' failed\n", obj_path);
         return 1;
     }
 
@@ -419,23 +479,17 @@ int main(int argc, char **argv)
     }
 
     /* Prepare JSONL capture file */
+    strncpy(g_out_dir, getdents_only ? "events/score" : "events", sizeof(g_out_dir)-1);
+    g_out_dir[sizeof(g_out_dir)-1] = '\0';
     if (mkdir("events", 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "[warn] failed to create events/ directory: %s\n", strerror(errno));
     }
-    char iso_ts[64];
-    current_time_iso8601(iso_ts, sizeof(iso_ts));
-    /* make filename-safe timestamp */
-    for (char *p = iso_ts; *p; ++p) { if (*p == ':' || *p == ' ') *p = '-'; }
-    char hostname[256] = {0};
-    if (gethostname(hostname, sizeof(hostname)) != 0)
-        strncpy(hostname, "unknown", sizeof(hostname)-1);
-    snprintf(g_jsonl_path, sizeof(g_jsonl_path), "events/capture_%s_%s.jsonl", iso_ts, hostname);
-    g_jsonl = fopen(g_jsonl_path, "w");
-    if (!g_jsonl) {
-        fprintf(stderr, "[warn] cannot open %s for writing: %s\n", g_jsonl_path, strerror(errno));
-    } else {
-        printf("Writing JSONL events to %s\n", g_jsonl_path);
+    if (getdents_only) {
+        if (mkdir("events/score", 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr, "[warn] failed to create events/score directory: %s\n", strerror(errno));
+        }
     }
+    open_new_jsonl();
 
     printf("eBPF program attached. Reading kernel stack traces. Press Ctrl+C to stop.\n");
     while (!exiting) {
