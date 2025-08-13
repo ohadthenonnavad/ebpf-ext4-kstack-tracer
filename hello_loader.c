@@ -21,6 +21,8 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 }
 
 static volatile sig_atomic_t exiting = 0;
+static FILE *g_jsonl = NULL;
+static char g_jsonl_path[512] = {0};
 
 static void sig_handler(int sig)
 {
@@ -163,7 +165,60 @@ static void read_comm_from_proc(int pid, char *buf, size_t bufsz)
         buf[len - 1] = '\0';
 }
 
-/* Write a single event to JSON file with agreed schema */
+/* Write a single event as one-line JSON (JSONL) */
+static void write_event_jsonl_line(FILE *out, int cpu, struct stack_trace_t *trace)
+{
+    if (!out) return;
+    char iso_ts[64];
+    current_time_iso8601(iso_ts, sizeof(iso_ts));
+
+    char hostname[256] = {0};
+    if (gethostname(hostname, sizeof(hostname)) != 0)
+        strncpy(hostname, "unknown", sizeof(hostname)-1);
+
+    char comm[64] = {0};
+    read_comm_from_proc(trace->pid, comm, sizeof(comm));
+
+    struct utsname uts;
+    memset(&uts, 0, sizeof(uts));
+    if (uname(&uts) != 0) {
+        strncpy(uts.release, "unknown", sizeof(uts.release)-1);
+    }
+
+    /* Infer probe from top-most frame symbol if available */
+    const char *probe = "unknown";
+    unsigned long long top_addr = 0, top_off = 0;
+    const char *top_name = NULL;
+    if (trace->kern_stack_size >= (int)sizeof(__u64)) {
+        top_addr = (unsigned long long)trace->kern_stack[0];
+        top_name = resolve_kaddr(top_addr, &top_off);
+        if (top_name)
+            probe = top_name;
+    }
+
+    int frames = trace->kern_stack_size / (int)sizeof(__u64);
+
+    /* Start JSON object */
+    fprintf(out, "{\"timestamp\":\"%s\",\"hostname\":\"%s\",\"kernel_version\":\"%s\",",
+            iso_ts, hostname, uts.release);
+    fprintf(out, "\"ls_pid\":%d,\"comm\":\"%s\",\"probe\":\"%s\",\"cpu\":%d,\"frames\":[",
+            trace->pid, comm, probe, cpu);
+
+    for (int i = 0; i < frames; i++) {
+        unsigned long long addr = (unsigned long long)trace->kern_stack[i];
+        unsigned long long off = 0;
+        const char *name = resolve_kaddr(addr, &off);
+        if (i) fputc(',', out);
+        if (name)
+            fprintf(out, "{\"index\":%d,\"addr\":\"0x%llx\",\"symbol\":\"%s\",\"offset\":\"0x%llx\"}",
+                    i, addr, name, off);
+        else
+            fprintf(out, "{\"index\":%d,\"addr\":\"0x%llx\",\"symbol\":null,\"offset\":\"0x0\"}",
+                    i, addr);
+    }
+    fputs("]}\n", out);
+    fflush(out);
+}
 static void write_event_json(int cpu, struct stack_trace_t *trace)
 {
     char iso_ts[64];
@@ -258,8 +313,8 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
     }
     fflush(stdout);
 
-    /* Additionally, write JSON event file */
-    write_event_json(cpu, trace);
+    /* Append JSONL line to the capture file */
+    write_event_jsonl_line(g_jsonl, cpu, trace);
 }
 
 static void handle_lost(void *ctx, int cpu, __u64 lost_cnt)
@@ -363,6 +418,25 @@ int main(int argc, char **argv)
         printf("Kernel symbolization unavailable (try 'sudo sysctl -w kernel.kptr_restrict=0').\n");
     }
 
+    /* Prepare JSONL capture file */
+    if (mkdir("events", 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "[warn] failed to create events/ directory: %s\n", strerror(errno));
+    }
+    char iso_ts[64];
+    current_time_iso8601(iso_ts, sizeof(iso_ts));
+    /* make filename-safe timestamp */
+    for (char *p = iso_ts; *p; ++p) { if (*p == ':' || *p == ' ') *p = '-'; }
+    char hostname[256] = {0};
+    if (gethostname(hostname, sizeof(hostname)) != 0)
+        strncpy(hostname, "unknown", sizeof(hostname)-1);
+    snprintf(g_jsonl_path, sizeof(g_jsonl_path), "events/capture_%s_%s.jsonl", iso_ts, hostname);
+    g_jsonl = fopen(g_jsonl_path, "w");
+    if (!g_jsonl) {
+        fprintf(stderr, "[warn] cannot open %s for writing: %s\n", g_jsonl_path, strerror(errno));
+    } else {
+        printf("Writing JSONL events to %s\n", g_jsonl_path);
+    }
+
     printf("eBPF program attached. Reading kernel stack traces. Press Ctrl+C to stop.\n");
     while (!exiting) {
         int ret = perf_buffer__poll(pb, 1000);
@@ -380,5 +454,9 @@ cleanup:
     /* Free perf buffer if created (safe to call with NULL) */
     perf_buffer__free(pb);
     bpf_object__close(obj);
+    if (g_jsonl) {
+        fclose(g_jsonl);
+        g_jsonl = NULL;
+    }
     return 0;
 }
