@@ -4,3 +4,4 @@
 *.ko filter=lfs diff=lfs merge=lfs -text
 *.bin filter=lfs diff=lfs merge=lfs -text
 rootkits/** filter=lfs diff=lfs merge=lfs -text
+events/*.jsonl filter=lfs diff=lfs merge=lfs -text
